@@ -2,6 +2,9 @@ import sys, os
 import unittest
 from unittest.mock import patch
 import numpy as np
+import shapely
+from shapely.geometry import Polygon, box
+from shapely.ops import unary_union
 from depot.maps import MapGen
 
 class TestMapGen(unittest.TestCase):
@@ -392,6 +395,32 @@ class TestMapGen(unittest.TestCase):
         mg = MapGen("TEST", [-118.5, 33.9, -118.4, 34.0],
                     osmpbf="dummy.osm.pbf", verb=False)
         mock_makedirs.assert_called()
+
+    ##### mask subtraction tests #####
+
+    def test_subtract_mask_matches_plain_difference(self):
+        """Clipping the mask to the feature must not change the result."""
+        mask = unary_union([box(0, 0, 4096, 300), box(1000, 0, 1200, 4096)])
+        for geom in [box(100, 100, 900, 900),          # overlaps one bar
+                     box(1050, 200, 1500, 600),        # overlaps both bars
+                     box(2000, 2000, 2400, 2400),      # overlaps neither
+                     box(0, 0, 4096, 4096)]:           # covers the whole mask
+            with self.subTest(geom=geom.bounds):
+                expected = geom.difference(mask)
+                self.assertAlmostEqual(MapGen._subtract_mask(geom, mask).area,
+                                       expected.area, places=6)
+
+    def test_subtract_mask_ignores_empty_masks(self):
+        """A missing or empty mask leaves the feature untouched."""
+        geom = box(0, 0, 100, 100)
+        self.assertIs(MapGen._subtract_mask(geom, None), geom)
+        self.assertIs(MapGen._subtract_mask(geom, Polygon()), geom)
+
+    def test_subtract_mask_returns_valid_geometry(self):
+        """Self-intersecting input still yields a valid result."""
+        bowtie = Polygon([(0, 0), (100, 100), (0, 100), (100, 0)]).buffer(0)
+        result = MapGen._subtract_mask(bowtie, box(0, 0, 50, 200))
+        self.assertTrue(result.is_valid)
 
 if __name__ == "__main__":
     unittest.main()

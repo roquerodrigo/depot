@@ -2120,7 +2120,6 @@ class MapGen:
                     if len(hits):
                         primary_id = water_ids[min(hits)]
 
-
                 water_feat = {
                     "geometry": mapping(part),
                     "properties": {"kind": "water", "sort_rank": 200},
@@ -2194,26 +2193,16 @@ class MapGen:
                     geom = geom.buffer(0) 
                 
                 # Subtract water from parks and aerodromes
-                if merged_result is not None and not merged_result.is_empty:
-                    if geom.intersects(merged_result):
-                        geom = geom.difference(merged_result)
-                        if not geom.is_valid:
-                            geom = geom.buffer(0)
-                
+                geom = self._subtract_mask(geom, merged_result)
+
                 # Subtract aerodromes from parks
-                if kind == "park" and aerodrome_mask is not None and not aerodrome_mask.is_empty:
-                    if geom.intersects(aerodrome_mask):
-                        geom = geom.difference(aerodrome_mask)
-                        if not geom.is_valid:
-                            geom = geom.buffer(0)
-                
+                if kind == "park":
+                    geom = self._subtract_mask(geom, aerodrome_mask)
+
                 # Subtract commercial from parks
-                if kind == "park" and commercial_mask is not None and not commercial_mask.is_empty:
-                    if geom.intersects(commercial_mask):
-                        geom = geom.difference(commercial_mask)
-                        if not geom.is_valid:
-                            geom = geom.buffer(0)
-                
+                if kind == "park":
+                    geom = self._subtract_mask(geom, commercial_mask)
+
                 # Final geometry verification & cleaning
                 if geom.is_empty or geom.area < 1.0:
                     continue  
@@ -2248,19 +2237,12 @@ class MapGen:
                     geom = geom.buffer(0)
                 
                 # Subtract water from commercial
-                if merged_result is not None and not merged_result.is_empty:
-                    if geom.intersects(merged_result):
-                        geom = geom.difference(merged_result)
-                        if not geom.is_valid:
-                            geom = geom.buffer(0)
-                
+                geom = self._subtract_mask(geom, merged_result)
+
                 # Subtract aerodromes from commercial
-                if kind == "commercial" and aerodrome_mask is not None and not aerodrome_mask.is_empty:
-                    if geom.intersects(aerodrome_mask):
-                        geom = geom.difference(aerodrome_mask)
-                        if not geom.is_valid:
-                            geom = geom.buffer(0)
-                
+                if kind == "commercial":
+                    geom = self._subtract_mask(geom, aerodrome_mask)
+
                 # Final geometry verification & cleaning
                 if geom.is_empty or geom.area < 1.0:
                     continue  
@@ -2289,6 +2271,43 @@ class MapGen:
             z, x, y, zlib.compress(mapbox_vector_tile.encode(layers_to_encode))
         )
     
+    @staticmethod
+    def _subtract_mask(geom, mask):
+        """
+        Subtracts `mask` from `geom`, clipping the mask to the feature first.
+
+        The cost of an overlay tracks the vertex count of both operands, so
+        subtracting a whole dissolved water body from one small polygon is far
+        more expensive than subtracting the piece of it that can overlap at all.
+        Clipping to the feature's bounding box first cannot change the result:
+        geometry outside that box cannot intersect the feature.
+
+        Inputs
+        ------
+        geom: shapely geometry. Feature to cut.
+        mask: shapely geometry or None. Geometry to subtract from the feature.
+
+        Returns
+        -------
+        geom: shapely geometry. The feature with the mask subtracted.
+        """
+        if mask is None or mask.is_empty or not geom.intersects(mask):
+            return geom
+
+        try:
+            cutter = shapely.clip_by_rect(mask, *geom.bounds)
+            if cutter.is_empty:
+                return geom
+            result = geom.difference(cutter)
+        except shapely.errors.GEOSException:
+            # clip_by_rect rejects some invalid inputs; the full mask still works
+            result = geom.difference(mask)
+
+        if not result.is_valid:
+            result = result.buffer(0)
+
+        return result
+
     def _get_local_bbox_mask(self, z, x, y):
         """
         Returns a Shapely box representing the global self.bbox mapped to 
