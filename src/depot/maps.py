@@ -2098,21 +2098,29 @@ class MapGen:
             
             if "water" not in new_layers_data:
                 new_layers_data["water"] = []
-            
+
+            # Index the source features once. Scanning them per dissolved part
+            # is O(parts x features), which dominates tiles carrying a large
+            # number of water features.
+            water_ids = [orig_id for orig_id, _ in water_id_map]
+            water_tree = STRtree([orig_geom for _, orig_geom in water_id_map]) \
+                         if water_id_map else None
+
             for part in final_parts:
                 if part.is_empty or part.area < 0.01:
                     continue
                 # Ensure exterior is CCW/CW as per spec
                 part = orient(part, sign=1.0)
-                # Find which original IDs belong to this new dissolved 'part'
-                associated_ids = []
-                for orig_id, orig_geom in water_id_map:
-                    if part.intersects(orig_geom):
-                        associated_ids.append(orig_id)
-                
-                # Determine the primary ID (using the first one found)
-                primary_id = associated_ids[0] if associated_ids else None
-                
+                # Find which original IDs belong to this new dissolved 'part'.
+                # Tree hits come back unordered, so the lowest index is the
+                # first match in the source order.
+                primary_id = None
+                if water_tree is not None:
+                    hits = water_tree.query(part, predicate="intersects")
+                    if len(hits):
+                        primary_id = water_ids[min(hits)]
+
+
                 water_feat = {
                     "geometry": mapping(part),
                     "properties": {"kind": "water", "sort_rank": 200},
