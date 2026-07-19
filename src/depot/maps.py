@@ -94,10 +94,15 @@ class MapGen:
     _rewrite_label_geojson_names : Normalizes feature properties.name based on 
                                    label_name_language.
     _select_label_name : Returns the label text to store in properties.name.
-    _get_road_name_jq_expression : Returns the jq expression used to populate 
+    _get_road_name_jq_expression : Returns the jq expression used to populate
                                    roads.geojson name.
     """
-    def __init__(self, city, bbox, osmpbf=None, outputdir='.', 
+    # Tiles read, processed and written per batch in fix_mbtiles, per core.
+    # Enough work to keep every worker busy without holding the whole map in
+    # memory.
+    TILE_BATCH_PER_CORE = 64
+
+    def __init__(self, city, bbox, osmpbf=None, outputdir='.',
                        building_index_filter_size=40, 
                        building_tile_filter_size=None, 
                        building_index_simplification=1,
@@ -2367,16 +2372,11 @@ class MapGen:
             print(f"***** Fixing MBTiles for {self.city} *****")
         conn = sqlite3.connect(input_path)
         cursor = conn.cursor()
-        cursor.execute("SELECT zoom_level, tile_column, tile_row, tile_data " \
-                       "FROM tiles")
-        all_tiles = cursor.fetchall()
-        
+        tile_count = cursor.execute("SELECT COUNT(*) FROM tiles").fetchone()[0]
+
         if self.verb:
-            print(f"Processing {len(all_tiles)} tiles using {self.ncores} " \
+            print(f"Processing {tile_count} tiles using {self.ncores} " \
                   f"cores...")
-        
-        with ProcessPoolExecutor(max_workers=self.ncores) as executor:
-            results = list(executor.map(self._process_tile_worker, all_tiles))
 
         # Setup output database
         out_conn = sqlite3.connect(output_path)
@@ -2385,15 +2385,30 @@ class MapGen:
                                              "tile_column integer, "\
                                              "tile_row integer, "\
                                              "tile_data blob)")
-        
+
         # Copy metadata from input
         cursor.execute("SELECT name, value FROM metadata")
-        out_conn.executemany("INSERT INTO metadata VALUES (?, ?)", 
+        out_conn.executemany("INSERT INTO metadata VALUES (?, ?)",
                              cursor.fetchall())
-        
-        # Insert processed tiles
-        out_conn.executemany("INSERT INTO tiles VALUES (?, ?, ?, ?)", results)
-        
+
+        # Read, process and write in batches. Holding every tile and every
+        # result in memory at once peaks at several GB on a large map.
+        tile_cursor = conn.cursor()
+        tile_cursor.execute("SELECT zoom_level, tile_column, tile_row, " \
+                            "tile_data FROM tiles")
+        batch_size = max(self.ncores, 1) * self.TILE_BATCH_PER_CORE
+        with ProcessPoolExecutor(max_workers=self.ncores) as executor:
+            with tqdm(total=tile_count, desc="Fixing tiles", unit="tile",
+                      disable=not self.verb) as pbar:
+                while True:
+                    batch = tile_cursor.fetchmany(batch_size)
+                    if not batch:
+                        break
+                    results = executor.map(self._process_tile_worker, batch)
+                    out_conn.executemany("INSERT INTO tiles VALUES (?, ?, ?, ?)",
+                                         results)
+                    pbar.update(len(batch))
+
         # Metadata Sync (class -> kind)
         out_conn.execute("UPDATE metadata SET value = REPLACE(value, "\
                                                             "'class', "\

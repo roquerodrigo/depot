@@ -1,7 +1,12 @@
 import sys, os
+import gzip
+import sqlite3
+import tempfile
 import unittest
+import zlib
 from unittest.mock import patch
 import numpy as np
+import mapbox_vector_tile
 import shapely
 from shapely.geometry import Polygon, box
 from shapely.ops import unary_union
@@ -395,6 +400,55 @@ class TestMapGen(unittest.TestCase):
         mg = MapGen("TEST", [-118.5, 33.9, -118.4, 34.0],
                     osmpbf="dummy.osm.pbf", verb=False)
         mock_makedirs.assert_called()
+
+    ##### fix_mbtiles tests #####
+
+    def _write_clean_mbtiles(self, path, tiles):
+        """An mbtiles holding gzipped vector tiles, as planetiler writes them."""
+        layers = [
+            {"name": "water", "extent": 4096, "version": 2, "features": [{
+                "geometry": "POLYGON((200 200, 3000 200, 3000 3000, 200 3000, 200 200))",
+                "properties": {"class": "lake", "id": 1}}]},
+            {"name": "landuse", "extent": 4096, "version": 2, "features": [{
+                "geometry": "POLYGON((1000 1000, 3500 1000, 3500 3500, 1000 3500, "
+                            "1000 1000))",
+                "properties": {"class": "park"}}]},
+        ]
+        blob = gzip.compress(mapbox_vector_tile.encode(layers))
+        conn = sqlite3.connect(path)
+        conn.execute("CREATE TABLE metadata (name text, value text)")
+        conn.execute("CREATE TABLE tiles (zoom_level integer, tile_column integer, "
+                     "tile_row integer, tile_data blob)")
+        conn.execute("INSERT INTO metadata VALUES ('json', '{\"vector_layers\":[]}')")
+        conn.executemany("INSERT INTO tiles VALUES (?, ?, ?, ?)",
+                         [(z, x, y, blob) for z, x, y in tiles])
+        conn.commit()
+        conn.close()
+
+    def test_fix_mbtiles_writes_every_tile(self):
+        """Batched processing must round-trip all tiles, not just the first batch."""
+        # Tiles inside the bbox, in TMS row order; tiles outside it are clipped away.
+        tiles = [(12, 1515 + (i % 8), 1770 - (i // 8)) for i in range(40)]
+        with tempfile.TemporaryDirectory() as outputdir:
+            with patch('os.path.exists'):
+                mg = MapGen("TST", [-47.22, -24.08, -45.68, -23.17], outputdir=outputdir,
+                            osmpbf="dummy.osm.pbf", ncores=2, verb=False)
+            os.makedirs(mg.city_dir, exist_ok=True)
+            mg.TILE_BATCH_PER_CORE = 3  # force several batches
+            self._write_clean_mbtiles(os.path.join(mg.city_dir, "tst-clean.mbtiles"), tiles)
+
+            mg.fix_mbtiles()
+
+            conn = sqlite3.connect(os.path.join(mg.city_dir, "tst-fixed.mbtiles"))
+            rows = conn.execute("SELECT zoom_level, tile_column, tile_row, tile_data "
+                                "FROM tiles").fetchall()
+            conn.close()
+
+        self.assertEqual(len(rows), len(tiles))
+        self.assertEqual({(z, x, y) for z, x, y, _ in rows}, set(tiles))
+        decoded = mapbox_vector_tile.decode(zlib.decompress(rows[0][3]))
+        self.assertIn("water", decoded)
+        self.assertIn("landuse", decoded)
 
     ##### mask subtraction tests #####
 
